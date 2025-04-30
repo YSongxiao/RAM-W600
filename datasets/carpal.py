@@ -4,7 +4,7 @@ from pycocotools.coco import COCO
 from pycocotools import mask as maskUtils
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import json
 import cv2
 import torch
 
@@ -278,7 +278,7 @@ class CarpalRegressionDataset_(Dataset):
         return len(self.gts)
 
 
-class CarpalClassificationDataset(Dataset):
+class CarpalClassificationDataset_(Dataset):
     def __init__(self, data_root, annotation_path, transform=None):
         self.data_root = data_root
         self.annotation = pd.read_excel(annotation_path)
@@ -294,14 +294,10 @@ class CarpalClassificationDataset(Dataset):
         for dir_path in self.filedirs:
             filename = dir_path.name
             matched_row = self.annotation[self.annotation["Image Link"] == filename + ".bmp"]
-            key = matched_row.keys()[2]
-            self.gts.append(matched_row[key].values[0] if matched_row[key].values[0] != 5 else 3)
-            self.joint_names.append(key)
-            self.joint_fnames.append(dir_path / (key + ".bmp"))
-            # for key in matched_row.keys()[1:]:
-            #     self.gts.append(matched_row[key].values[0] if matched_row[key].values[0] != 5 else 3)
-            #     self.joint_names.append(key)
-            #     self.joint_fnames.append(dir_path / (key + ".bmp"))
+            for key in matched_row.keys()[1:]:
+                self.gts.append(matched_row[key].values[0] if matched_row[key].values[0] != 5 else 3)
+                self.joint_names.append(key)
+                self.joint_fnames.append(dir_path / (key + ".bmp"))
 
     def __getitem__(self, idx):
         # 归一化
@@ -310,7 +306,7 @@ class CarpalClassificationDataset(Dataset):
             return (data - np.min(data)) / range
 
         img = cv2.imread(str(self.joint_fnames[idx]), cv2.IMREAD_GRAYSCALE)
-        gt = self.gts[idx]
+        gt = self.gts[idx] if self.gts[idx] == 0 else 1
         img = normalization(img[..., np.newaxis]).astype(np.float32)
 
         if self.joint_fnames[idx].stem[-1] == "L":
@@ -328,6 +324,63 @@ class CarpalClassificationDataset(Dataset):
 
     def __len__(self):
         return len(self.gts)
+
+
+class CarpalClassificationDataset(Dataset):
+    def __init__(self, data_root, annotation_path, transform=None):
+        self.data_root = Path(data_root)
+        self.transform = transform
+
+        # 读取JSON
+        with open(annotation_path, 'r') as f:
+            self.annotation = json.load(f)
+
+        self.joint_fnames = []
+        self.joint_names = []
+        self.gts = []
+
+        joint_list = ["Metacarpal1st", "Trapzium", "Scaphoid", "Lunate", "DistalRadius", "DistalUlna"]
+
+        for item in self.annotation:
+            identifier = item["identifier"]  # 如 0172_0003_L
+            joints = item["joints"]          # 字典，包含上述每个关节名及其评分
+            dir_path = self.data_root / identifier
+
+            for joint_name in joint_list:
+                joint_path = dir_path / f"{joint_name}.bmp"
+                if not joint_path.exists():
+                    continue
+                score = joints[joint_name]
+                self.gts.append(score if score == 0 else 1)
+                self.joint_names.append(joint_name)
+                self.joint_fnames.append(joint_path)
+
+    def __getitem__(self, idx):
+        def normalization(data):
+            range_val = np.max(data) - np.min(data)
+            return (data - np.min(data)) / range_val if range_val != 0 else data
+
+        img_path = self.joint_fnames[idx]
+        img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        img = normalization(img[..., np.newaxis]).astype(np.float32)
+
+        # 左手图像水平翻转
+        if img_path.stem.endswith("L"):
+            img = cv2.flip(img, 1)
+
+        if self.transform:
+            img = self.transform(image=img)["image"]
+
+        data = {
+            "fname": str(img_path),
+            "key": self.joint_names[idx],
+            "img": img,
+            "gt": torch.tensor(self.gts[idx], dtype=torch.int64),
+        }
+        return data
+
+    def __len__(self):
+        return len(self.joint_fnames)
 
 
 def get_dataloader(dataset, batch_size, shuffle=False):

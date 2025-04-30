@@ -3,16 +3,14 @@ from utils import *
 from trainer import RegTrainer, RegTester
 import monai
 from pathlib import Path
-from datasets.carpal import CarpalRegressionDataset_, CarpalTotalRegressionDataset, CarpalClassificationDataset, get_dataloader, get_dataloader_sampler, get_dataloader_sampler_reg
+from datasets.carpal import CarpalClassificationDataset, get_dataloader
 import torch.optim as optim
 from datetime import datetime
 from typing import Union
-import torchvision
 import torch.nn as nn
-from models.UnetPlusPlus import UnetPlusPlus
-from models.swin_unet.swin_unet import get_SwinUnet_Custom
-from models.Seg_UKAN.archs import UKAN
-from models.TransUNet.transUnet import get_TransUnet_Custom
+import timm
+from models.MedMamba import VSSM as medmamba
+from conv_kan_baseline import SimpleConvKAN
 
 
 def get_args():
@@ -58,7 +56,7 @@ def get_args():
         '--model',
         type=str,
         default="ResNet",
-        choices=["DenseNet", "EfficientNet", "ViT", "Swin", "ResNet", "ViT"],
+        choices=["ResNet", "KAN", "MobileNet", "EfficientFormer", "MedMamba", "MobileViT", "LeViT"],
         help='The name of the model.',
     )
 
@@ -73,7 +71,7 @@ def get_args():
     parser.add_argument(
         '--num_classes',
         type=int,
-        default=4,
+        default=2,
         help='Number of output channel.',
     )
 
@@ -94,28 +92,21 @@ def get_args():
     parser.add_argument(
         '--data_path',
         type=str,
-        default="/mnt/data2/datasx/Carpal/ExportedDataset/Regression/V3",
+        default="/path/to/data",
         help='The path to data.',
-    )
-
-    parser.add_argument(
-        '--pretrain_path',
-        type=str,
-        default="./pretrained_weights/",
-        help='The path of pretrained weights.',
     )
 
     parser.add_argument(
         '--checkpoint',
         type=str,
-        default="ckpts/regression_densenet_202504152155/",
+        default="",
         help='The pretrained weight of the model.',
     )
 
     parser.add_argument(
         '--trial_name',
         type=str,
-        default="classification",
+        default="Function_Test",
         help='The name of the trial.',
     )
 
@@ -129,14 +120,14 @@ def get_args():
     parser.add_argument(
         '--lr',
         type=float,
-        default=1e-7,
+        default=1e-6,
         help='Initial lr',
     )
 
     parser.add_argument(
         '--save_csv',
         action='store_true',
-        default=False,
+        default=True,
         help='Whether save csv (Test mode only).',
     )
     args = parser.parse_args()
@@ -149,11 +140,7 @@ seed_everything(args.seed)
 
 
 # initial network
-if args.model == "DenseNet":
-    net = monai.networks.nets.DenseNet121(spatial_dims=2, in_channels=1, out_channels=1, init_features=64,
-                                          growth_rate=32, block_config=(6, 12, 24, 16), pretrained=False, progress=False)
-
-elif args.model == "EfficientNet":
+if args.model == "EfficientNet":
     net = monai.networks.nets.EfficientNetBN("efficientnet-b0", pretrained=False, progress=False, spatial_dims=2,
                                              in_channels=1, num_classes=args.num_classes,
                                              norm=('batch', {'eps': 0.001, 'momentum': 0.01}), adv_prop=False)
@@ -164,13 +151,42 @@ elif args.model == "ResNet":
                                      num_classes=args.num_classes, feed_forward=True, bias_downsample=True,
                                      act=('relu', {'inplace': True}), norm='batch')
 
-elif args.model == "ViT":
-    net = monai.networks.nets.ViT(in_channels=1, img_size=args.image_size, patch_size=8, hidden_size=64, mlp_dim=128, num_layers=4,
-                            num_heads=4, proj_type='conv', pos_embed_type='learnable', classification=True,
-                            num_classes=args.num_classes, dropout_rate=0.2, spatial_dims=2, post_activation='Tanh', qkv_bias=False,
-                            save_attn=False)
+elif args.model == "KAN":
+    net = SimpleConvKAN([8 * 4, 16 * 4, 32 * 4, 64 * 4], num_classes=2, input_channels=1, spline_order=3, groups=1,
+                        dropout=0.25, dropout_linear=0.5, l1_penalty=0.00000, degree_out=1)
 
-print(f"Model size: {sum(p.numel() for p in net.parameters())}")
+elif args.model == "MobileNet":
+    net = timm.create_model(
+                'mobilenetv2_050',    # 你想用的模型
+                            pretrained=False,     # 不使用预训练
+                            in_chans=1,           # 1 通道图像（灰度图）
+                            num_classes=2         # 二分类
+                )
+
+elif args.model == "EfficientFormer":
+    net = timm.create_model(
+                            "efficientformerv2_s0",
+                            pretrained=False,
+                            in_chans=1,
+                            num_classes=2
+                )
+
+elif args.model == "MedMamba":
+    net = medmamba(in_chans=1, num_classes=2)
+
+elif args.model == "RepViT":
+    net = timm.create_model("repvit_m2_3.dist_300e_in1k", pretrained=False, in_chans=1, num_classes=2)
+    # net = timm.create_model('repvit_m0_9', pretrained=False, in_chans=1, num_classes=2)
+
+elif args.model == "MobileViT":
+    net = timm.create_model('mobilevit_s', pretrained=False, in_chans=1, num_classes=2)
+
+elif args.model == "LeViT":
+    net = timm.create_model('levit_128s', pretrained=False, in_chans=1, num_classes=2)
+
+
+n_params = sum(p.numel() for p in net.parameters())
+print(f"Total parameters: {n_params / 1e6:.2f} M ({n_params:,} parameters)")
 
 # pretrain_path = os.path.join(args.pretrain_path, args.checkpoint)
 # if os.path.exists(pretrain_path):
@@ -187,37 +203,32 @@ if args.mode == "train":
     if not ckpt_path.exists():
         ckpt_path.mkdir(parents=True)
     args.model_save_path = str(ckpt_path)
-    transform_tr = get_reg_transform(split="train", image_size=args.image_size)
-    transform_val = get_reg_transform(split="val", image_size=args.image_size)
+    transform_tr = get_cls_transform(split="train", image_size=args.image_size)
+    transform_val = get_cls_transform(split="val", image_size=args.image_size)
     train_dataset = CarpalClassificationDataset(data_root=Path(args.data_path) / "train",
-                                            annotation_path=Path(args.data_path) / "JointBE_SvdH_GT.xlsx",
+                                            annotation_path=Path(args.data_path) / "JointBE_SvdH_GT_reformatted.json",
                                             transform=transform_tr)
-    # import matplotlib.pyplot as plt
-    # plt.hist(train_dataset.total_gts)
-    # plt.show()
-    train_loader = get_dataloader_sampler(train_dataset, batch_size=args.train_batch_size, shuffle=False)
+    train_loader = get_dataloader(train_dataset, batch_size=args.train_batch_size, shuffle=True)
     val_dataset = CarpalClassificationDataset(data_root=Path(args.data_path) / "val",
-                                          annotation_path=Path(args.data_path) / "JointBE_SvdH_GT.xlsx",
+                                          annotation_path=Path(args.data_path) / "JointBE_SvdH_GT_reformatted.json",
                                           transform=transform_val)
-    val_loader = get_dataloader_sampler(val_dataset, batch_size=args.val_batch_size, shuffle=False)
+    val_loader = get_dataloader(val_dataset, batch_size=args.val_batch_size, shuffle=True)
 
-    optimizer = optim.Adam(net.parameters(), lr=args.lr, amsgrad=True)
-    # optimizer = optim.AdamW(net.parameters(), lr=args.lr, amsgrad=True)
+    # optimizer = optim.Adam(net.parameters(), lr=args.lr, amsgrad=True)
+    optimizer = optim.AdamW(net.parameters(), lr=args.lr)
     # optimizer = optim.SGD(net.parameters(), lr=args.lr)
     # criterion = FocalRegressionLoss(gamma=2.0, reduction='mean')
     # criterion = nn.MSELoss()
-    criterion = CDW_CELoss(class_weights=torch.tensor([2.0, 0.8, 0.8, 1.0], device="cuda:0"))
-    # criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.5, 1.0, 1.0, 1.2], device="cuda:0"))
+    # criterion = CDW_CELoss(class_weights=torch.tensor([2.0, 0.8, 0.8, 1.0], device="cuda:0"))
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 6.0], device="cuda:0")) # [1.0, 6.0]
     # criterion = nn.CrossEntropyLoss()
-    # alpha = torch.tensor([3.0, 1.0, 1.0, 1.0, 1.0]).to("cuda:0")  # 类别权重（可选）
-    # criterion = FocalLossMultiClass(gamma=2.0, alpha=alpha)
     trainer = RegTrainer(args, net, train_loader, val_loader, criterion, optimizer, device="cuda:0")
     trainer.fit(args)
 
 elif args.mode == "test":
-    transform_test = get_reg_transform(split="test", image_size=args.image_size)
+    transform_test = get_cls_transform(split="test", image_size=args.image_size)
     test_dataset = CarpalClassificationDataset(data_root=Path(args.data_path) / "test",
-                                           annotation_path=Path(args.data_path) / "JointBE_SvdH_GT.xlsx",
+                                           annotation_path=Path(args.data_path) / "JointBE_SvdH_GT_reformatted.json",
                                            transform=transform_test)
     test_loader = get_dataloader(test_dataset, batch_size=1, shuffle=False)
     if not (Path(args.checkpoint) / "model_best.pth").exists():

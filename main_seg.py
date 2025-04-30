@@ -31,7 +31,7 @@ def get_args():
         '--mode',
         type=str,
         default="train",
-        choices=["train", "test"],
+        choices=["train", "test", "infer"],
         help='Mode',
     )
 
@@ -90,21 +90,14 @@ def get_args():
     parser.add_argument(
         '--data_path',
         type=str,
-        default="/mnt/data2/datasx/Carpal/ExportedDataset/FHM-W400_v1/Segmentation/",
+        default="/path/to/data",
         help='The path to data.',
-    )
-
-    parser.add_argument(
-        '--pretrain_path',
-        type=str,
-        default="./pretrained_weights/",
-        help='The path of pretrained weights.',
     )
 
     parser.add_argument(
         '--checkpoint',
         type=str,
-        default="ckpts/test_swinunet_202504042334/",
+        default="",
         help='The pretrained weight of the model.',
     )
 
@@ -142,6 +135,13 @@ def get_args():
         default=False,
         help='Whether save csv (Test mode only).',
     )
+
+    parser.add_argument(
+        '--save_pred',
+        action='store_true',
+        default=False,
+        help='Whether save pred (Test mode only).',
+    )
     args = parser.parse_args()
     return args
 
@@ -154,7 +154,7 @@ seed_everything(args.seed)
 # initial network
 if args.model == "Unet":
     net = monai.networks.nets.DynUNet(spatial_dims=2, in_channels=1, out_channels=14, kernel_size=[3, 3, 3, 3, 3],
-                                      norm_name="batch", strides=[1, 2, 2, 2, 2], upsample_kernel_size=[2, 2, 2, 2],
+                                      norm_name="batch", strides=[1, 2, 2, 2, 2], upsample_kernel_size=[2, 2, 2, 2, 2],
                                       filters=[32, 64, 128, 256, 512], res_block=True)
 
 elif args.model == "SegResNet":
@@ -184,7 +184,7 @@ elif args.model == "DeepLabV3+":
     net = smp.DeepLabV3Plus(in_channels=1, encoder_weights=None, classes=14)
 
 elif args.model == "DeepLabV3":
-    net = smp.DeepLabV3Plus(in_channels=1, encoder_weights=None, classes=14)
+    net = smp.DeepLabV3(in_channels=1, encoder_weights=None, classes=14)
 
 elif args.model == "PSPNet":
     net = smp.PSPNet(in_channels=1, encoder_weights=None, classes=14)
@@ -210,7 +210,8 @@ elif args.model == "UMambaEnc":
 elif args.model == "SwinUMamba":
     net = get_SwinUMamba(in_channels=1, num_classes=14)
 
-print(f"Model size: {sum(p.numel() for p in net.parameters())}")
+n_params = sum(p.numel() for p in net.parameters())
+print(f"Total parameters: {n_params / 1e6:.2f} M ({n_params:,} parameters)")
 
 # pretrain_path = os.path.join(args.pretrain_path, args.checkpoint)
 # if os.path.exists(pretrain_path):
@@ -244,6 +245,18 @@ if args.mode == "train":
     criterion = monai.losses.DiceLoss(sigmoid=False, squared_pred=True, reduction='mean')
     trainer = SegTrainer(args, net, train_loader, val_loader, criterion, optimizer, device="cuda:0")
     trainer.fit(args)
+
+elif args.mode == "test":
+    transform_test = get_transform(split="test", image_size=args.image_size)
+    test_dataset = CarpalNpyDataset(data_root=Path(args.data_path) / "image", annotation_path=Path(args.data_path) / "mask" / "test",
+                                    transform=transform_test)
+    # test_dataset = CarpalDataset(data_root=args.data_path, annotation_path=Path(args.data_path) / "test.coco.json",
+    #                              transform=transform_test)
+    test_loader = get_dataloader(test_dataset, batch_size=1, shuffle=False)
+    if not (Path(args.checkpoint) / "model_best.pth").exists():
+        raise KeyError("Test mode is set but checkpoint does not exist.")
+    tester = SegTester(args, net, test_loader, device="cuda:0")
+    tester.test()
 
 elif args.mode == "test":
     transform_test = get_transform(split="test", image_size=args.image_size)
