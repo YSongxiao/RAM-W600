@@ -2,3 +2,5 @@ __pycache__/
 ckpts/
 test.py
 *.pth
+debug.py
+*.sh

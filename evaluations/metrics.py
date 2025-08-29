@@ -2,12 +2,16 @@ from torchmetrics.classification import MultilabelAccuracy, MultilabelPrecision,
 import monai
 import numpy as np
 import torch
+from itertools import combinations
 from monai.metrics.metric import CumulativeIterationMetric
 from torchmetrics.classification import BinaryAccuracy, BinaryPrecision, BinaryRecall, BinaryF1Score, BinarySpecificity, BinaryConfusionMatrix
 
 bone_name_dict = {0: "Capitate", 1: "DistalRadius", 2: "DistalUlna", 3: "Hamate", 4: "Lunate", 5: "Pisifrom&Triquetrum",
                   6: "Scaphoid", 7: "Trapzium", 8: "Trapzoid", 9: "metacarpal1st", 10: "metacarpal2nd",
                   11: "metacarpal3rd", 12: "metacarpal4th", 13: "metacarpal5th"}
+
+overlap_pairs = [(1, 6), (1, 4), (6, 7), (0, 6), (7, 9), (0, 11), (3, 12), (4, 6), (7, 8), (0, 8),
+                 (3, 13), (7, 10), (8, 10), (10, 11)]  # , (1, 2), (6, 8), (9, 10)
 
 
 class RAVDMetric(CumulativeIterationMetric):
@@ -57,6 +61,198 @@ class VOEMetric:
         return voe
 
 
+class OverlapMetric:
+    def __init__(self, nsd_tolerance, num_classes):
+        self.nsd_tolerance = nsd_tolerance
+        self.num_classes = num_classes
+
+        self.dsc = monai.metrics.DiceMetric(reduction="none")
+        self.nsd = monai.metrics.SurfaceDiceMetric(
+            class_thresholds=[self.nsd_tolerance],
+            include_background=True,
+            reduction="none"
+        )
+
+    def __call__(self, pred_bin, gt_bin):
+        dsc_per_pair = []
+        nsd_per_pair = []
+        avg_dsc = []
+        avg_nsd = []
+        valid_pairs = []
+
+        for b in range(gt_bin.shape[0]):
+            dsc_per_pair_ = []
+            nsd_per_pair_ = []
+            valid_pairs_ = []
+
+            pred_overlap_list = []
+            gt_overlap_list = []
+
+            for i, j in combinations(range(self.num_classes), 2):
+                gt_i = gt_bin[b][i] > 0
+                gt_j = gt_bin[b][j] > 0
+                gt_overlap = torch.logical_and(gt_i, gt_j)
+
+                if not gt_overlap.any():
+                    continue  # skip non-overlapping pairs in GT
+
+                pred_i = pred_bin[b][i] > 0
+                pred_j = pred_bin[b][j] > 0
+                pred_overlap = torch.logical_and(pred_i, pred_j)
+
+                # 构造 [1, 1, H, W] 格式以兼容 MONAI Metric
+                gt_tensor = gt_overlap[None, None].float()
+                pred_tensor = pred_overlap[None, None].float()
+
+                gt_overlap_list.append(gt_tensor)
+                pred_overlap_list.append(pred_tensor)
+                valid_pairs_.append((i, j))
+
+            if len(gt_overlap_list) == 0:
+                # 当前样本没有任何 valid pair
+                avg_dsc.append(0.0)
+                avg_nsd.append(0.0)
+                dsc_per_pair.append([])
+                nsd_per_pair.append([])
+                valid_pairs.append([])
+                continue
+
+            # 堆叠成 [N, 1, H, W]
+            pred_stack = torch.cat(pred_overlap_list, dim=0)
+            gt_stack = torch.cat(gt_overlap_list, dim=0)
+
+            # 计算 Dice
+            dsc_values = self.dsc(pred_stack, gt_stack).detach().cpu()
+
+            # 计算 NSD
+            nsd_values = self.nsd(pred_stack, gt_stack).detach().cpu()
+
+            # 处理 NSD 中的 nan 值（替换为 0.0）
+            nsd_values = torch.nan_to_num(nsd_values, nan=0.0)
+
+            for i in range(len(valid_pairs_)):
+                dsc_per_pair_.append(dsc_values[i].item())
+                nsd_per_pair_.append(nsd_values[i].item())
+
+            avg_dsc_ = dsc_values.mean().item()
+            avg_nsd_ = nsd_values.mean().item()
+
+            dsc_per_pair.append(dsc_per_pair_)
+            nsd_per_pair.append(nsd_per_pair_)
+            avg_dsc.append(avg_dsc_)
+            avg_nsd.append(avg_nsd_)
+            valid_pairs.append(valid_pairs_)
+
+        return avg_dsc, avg_nsd, dsc_per_pair, nsd_per_pair, valid_pairs
+
+    def get_valid_pairs(self, gt_bin):
+        valid_pairs = []
+        for i, j in combinations(range(self.num_classes), 2):
+            if torch.logical_and(gt_bin[i] > 0, gt_bin[j] > 0).any():
+                valid_pairs.append((i, j))
+        return valid_pairs
+
+
+class NewOverlapMetric:
+    def __init__(self, nsd_tolerance, num_classes, overlap_pairs):
+        self.nsd_tolerance = nsd_tolerance
+        self.num_classes = num_classes
+
+        self.dsc = monai.metrics.DiceMetric(reduction="none")
+        self.nsd = monai.metrics.SurfaceDiceMetric(
+            class_thresholds=[self.nsd_tolerance for _ in range(len(overlap_pairs))],
+            include_background=True,
+            reduction="none",
+            get_not_nans=True
+        )
+        self.voe = VOEMetric(monai.metrics.MeanIoU(include_background=True, reduction="none"))
+        self.msd = monai.metrics.SurfaceDistanceMetric(include_background=True, symmetric=True, reduction="none", get_not_nans=True)
+        self.ravd = RAVDMetric(include_background=True)
+        self.valid_pairs = overlap_pairs
+
+    def __call__(self, pred_bin, gt_bin):
+        """
+        pred_bin, gt_bin: [B, num_classes, H, W]
+        overlap_pairs: list of (i, j) tuples specifying which bone pairs to evaluate
+        """
+        dsc_per_pair = None
+        nsd_per_pair = None
+        voe_per_pair = None
+        msd_per_pair = None
+        ravd_per_pair = None
+        avg_dsc = []
+        avg_nsd = []
+        avg_voe = []
+        avg_msd = []
+        avg_ravd = []
+
+        new_pred_bin = None
+        new_gt_bin = None
+        for pair in self.valid_pairs:
+            if new_pred_bin is None:
+                new_pred_bin = torch.logical_and(pred_bin[:, pair[0], ...], pred_bin[:, pair[1], ...]).unsqueeze(1)
+                new_gt_bin = torch.logical_and(gt_bin[:, pair[0], ...], gt_bin[:, pair[1], ...]).unsqueeze(1)
+            else:
+                pred_overlap_bin = torch.logical_and(pred_bin[:, pair[0], ...], pred_bin[:, pair[1], ...]).unsqueeze(1)
+                gt_overlap_bin = torch.logical_and(gt_bin[:, pair[0], ...], gt_bin[:, pair[1], ...]).unsqueeze(1)
+                new_pred_bin = torch.cat([new_pred_bin, pred_overlap_bin], dim=1)
+                new_gt_bin = torch.cat([new_gt_bin, gt_overlap_bin], dim=1)
+
+        dsc_values = self.dsc(new_pred_bin, new_gt_bin).detach().cpu()
+        nsd_values = self.nsd(new_pred_bin, new_gt_bin).detach().cpu()
+
+        voe_values = self.voe(new_pred_bin, new_gt_bin).squeeze()
+        msd_values = self.msd(new_pred_bin, new_gt_bin).squeeze()
+        # 删除：不再把 inf 改成 nan
+        # msd_values = torch.where(torch.isfinite(msd_values), msd_values,
+        #                          torch.tensor(float('nan'), device=msd_values.device, dtype=msd_values.dtype))
+        ravd_values = self.ravd(new_pred_bin, new_gt_bin).squeeze()
+
+        avg_dsc_ = dsc_values.nanmean().item()
+        avg_nsd_ = nsd_values.nanmean().item()
+
+        avg_voe_ = voe_values.nanmean().item()
+        # 这里用 isfinite 跳过 inf 与 nan；若没有有限值则返回 nan
+        _finite = torch.isfinite(msd_values)
+        avg_msd_ = msd_values[_finite].mean().item() if _finite.any() else float('nan')
+        avg_ravd_ = ravd_values.nanmean().item()
+
+        if dsc_per_pair is None:
+            dsc_per_pair = dsc_values
+        else:
+            dsc_per_pair = torch.cat([dsc_per_pair, dsc_values], dim=0)
+
+        if nsd_per_pair is None:
+            nsd_per_pair = nsd_values
+        else:
+            nsd_per_pair = torch.cat([nsd_per_pair, nsd_values], dim=0)
+
+        if voe_per_pair is None:
+            voe_per_pair = voe_values
+        else:
+            voe_per_pair = torch.cat([voe_per_pair, voe_values], dim=0)
+
+        if msd_per_pair is None:
+            msd_per_pair = msd_values
+        else:
+            msd_per_pair = torch.cat([msd_per_pair, msd_values], dim=0)
+
+        if ravd_per_pair is None:
+            ravd_per_pair = ravd_values
+        else:
+            ravd_per_pair = torch.cat([ravd_per_pair, ravd_values], dim=0)
+        avg_dsc.append(avg_dsc_)
+        avg_nsd.append(avg_nsd_)
+
+        avg_voe.append(avg_voe_)
+        avg_msd.append(avg_msd_)
+        avg_ravd.append(avg_ravd_)
+
+        return (np.array(avg_dsc), np.array(avg_nsd), np.array(avg_voe), np.array(avg_msd), np.array(avg_ravd),
+                dsc_per_pair.squeeze().numpy(), nsd_per_pair.squeeze().numpy(), voe_per_pair.squeeze().numpy(),
+                msd_per_pair.squeeze().numpy(), ravd_per_pair.squeeze().numpy(), self.valid_pairs)
+
+
 class SegmentationMetrics:
     def __init__(self, num_classes):
         self.num_labels = num_classes
@@ -81,6 +277,18 @@ class SegmentationMetrics:
         self.msd_reduced = []
         self.ravd_per_channel = []
         self.ravd_reduced = []
+
+        self.overlap_dsc_reduced = []
+        self.overlap_nsd_reduced = []
+        self.overlap_voe_reduced = []
+        self.overlap_msd_reduced = []
+        self.overlap_ravd_reduced = []
+        self.overlap_dsc_per_pair = []
+        self.overlap_nsd_per_pair = []
+        self.overlap_voe_per_pair = []
+        self.overlap_msd_per_pair = []
+        self.overlap_ravd_per_pair = []
+        self.overlap_pairs = []
         # self.accuracy = MultilabelAccuracy(num_labels=num_labels, average="none")
         # self.precision = MultilabelPrecision(num_labels=num_labels, average="none")
         # self.recall = MultilabelRecall(num_labels=num_labels, average="none")
@@ -92,79 +300,77 @@ class SegmentationMetrics:
         self.voe = VOEMetric(monai.metrics.MeanIoU(include_background=True, reduction="none"))
         self.msd = monai.metrics.SurfaceDistanceMetric(include_background=True, symmetric=True, reduction="none")
         self.ravd = RAVDMetric(include_background=True)
+        self.overlap_metric = NewOverlapMetric(nsd_tolerance=2, num_classes=num_classes, overlap_pairs=overlap_pairs)
 
     def update_metrics(self, pred_bin, gt, fname):
         self.fnames.append(fname)
         pred_bin = pred_bin.detach().cpu()
         gt = gt.detach().cpu()
-        # pred_flat = pred_bin.permute(0, 2, 3, 1).reshape(-1, pred_bin.shape[1]).detach().cpu()
-        # gt_flat = gt.permute(0, 2, 3, 1).reshape(-1, gt.shape[1]).detach().cpu()
-
-        # acc_pc = self.accuracy(pred_flat, gt_flat)
-        # prec_pc = self.precision(pred_flat, gt_flat)
-        # recall_pc = self.recall(pred_flat, gt_flat)
-        # f1_pc = self.f1(pred_flat, gt_flat)
 
         dsc_pc = self.dsc(pred_bin, gt).squeeze()
         nsd_pc = self.nsd(pred_bin, gt).squeeze()
         voe_pc = self.voe(pred_bin, gt).squeeze()
         msd_pc = self.msd(pred_bin, gt).squeeze()
         ravd_pc = self.ravd(pred_bin, gt).squeeze()
-        # hd95_pc = self.hd95(pred_bin, gt).squeeze()
-
-        # self.acc_per_channel.append(acc_pc)
-        # self.prec_per_channel.append(prec_pc)
-        # self.recall_per_channel.append(recall_pc)
-        # self.f1_per_channel.append(f1_pc)
+        (avg_dsc, avg_nsd, avg_voe, avg_msd, avg_ravd, dsc_per_pair, nsd_per_pair, voe_per_pair, msd_per_pair,
+         ravd_per_pair, valid_pairs) = self.overlap_metric(pred_bin, gt)
 
         self.dsc_per_channel.append(dsc_pc)
         self.nsd_per_channel.append(nsd_pc)
         self.voe_per_channel.append(voe_pc)
         self.msd_per_channel.append(msd_pc)
         self.ravd_per_channel.append(ravd_pc)
-        # self.hd95_per_channel.append(hd95_pc)
-
-        # self.acc_reduced.append(acc_pc.mean())
-        # self.prec_reduced.append(prec_pc.mean())
-        # self.recall_reduced.append(recall_pc.mean())
-        # self.f1_reduced.append(f1_pc.mean())
+        self.overlap_dsc_per_pair.append(dsc_per_pair)
+        self.overlap_nsd_per_pair.append(nsd_per_pair)
+        self.overlap_voe_per_pair.append(voe_per_pair)
+        self.overlap_msd_per_pair.append(msd_per_pair)
+        self.overlap_ravd_per_pair.append(ravd_per_pair)
 
         self.dsc_reduced.append(dsc_pc.mean())
         self.nsd_reduced.append(nsd_pc.mean())
         self.voe_reduced.append(voe_pc.mean())
-        self.msd_reduced.append(msd_pc.mean())
+        self.msd_reduced.append(msd_pc[np.isfinite(msd_pc)].mean() if np.isfinite(msd_pc).any() else np.nan)
         self.ravd_reduced.append(ravd_pc.mean())
-        # self.hd95_reduced.append(hd95_pc.mean())
+        self.overlap_dsc_reduced.append(avg_dsc)
+        self.overlap_nsd_reduced.append(avg_nsd)
+        self.overlap_voe_reduced.append(avg_voe)
+        self.overlap_msd_reduced.append(avg_msd)
+        self.overlap_ravd_reduced.append(avg_ravd)
+
+        # self.overlap_pairs.append(valid_pairs)
+        self.overlap_pairs = valid_pairs
 
     def get_metrics(self):
         metrics = {
-            # "accuracy_pc": np.array(self.acc_per_channel),
-            # "precision_pc": np.array(self.prec_per_channel),
-            # "recall_pc": np.array(self.recall_per_channel),
-            # "f1score_pc": np.array(self.f1_per_channel),
+
             "dsc_pc": np.array(self.dsc_per_channel),
             "nsd_pc": np.array(self.nsd_per_channel),
             "voe_pc": np.array(self.voe_per_channel),
             "msd_pc": np.array(self.msd_per_channel),
             "ravd_pc": np.array(self.ravd_per_channel),
-            # "hd95_pc": np.array(self.hd95_per_channel),
-            # "accuracy": np.array(self.acc_reduced),
-            # "precision": np.array(self.prec_reduced),
-            # "recall": np.array(self.recall_reduced),
-            # "f1score": np.array(self.f1_reduced),
+            "overlap_dsc_per_pair": self.overlap_dsc_per_pair,
+            "overlap_nsd_per_pair": self.overlap_nsd_per_pair,
+            "overlap_voe_per_pair": self.overlap_voe_per_pair,
+            "overlap_msd_per_pair": self.overlap_msd_per_pair,
+            "overlap_ravd_per_pair": self.overlap_ravd_per_pair,
+
             "dsc": np.array(self.dsc_reduced),
             "nsd": np.array(self.nsd_reduced),
             "voe": np.array(self.voe_reduced),
-            "msd": np.array(self.msd_reduced),
+            "msd": np.where(np.isfinite(self.msd_reduced), self.msd_reduced, np.nan),
             "ravd": np.array(self.ravd_reduced),
+            "overlap_dsc": np.array(self.overlap_dsc_reduced),
+            "overlap_nsd": np.array(self.overlap_nsd_reduced),
+            "overlap_voe": np.array(self.overlap_voe_reduced),
+            "overlap_msd": np.array(self.overlap_msd_reduced),
+            "overlap_ravd": np.array(self.overlap_ravd_reduced),
+            "overlap_pairs": self.overlap_pairs,
             # "hd95": np.array(self.hd95_reduced),
             "fname": self.fnames,
         }
         return metrics
 
 
-import numpy as np
-import torch
 from torchmetrics.classification import (
     BinaryAccuracy, BinaryPrecision, BinaryRecall, BinaryF1Score, BinarySpecificity, BinaryConfusionMatrix
 )

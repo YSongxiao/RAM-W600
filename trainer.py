@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 from torch.cuda.amp import GradScaler, autocast
+from torch import amp
 from pathlib import Path
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -172,6 +173,168 @@ class SegTrainer:
         plt.close()
 
 
+class IterSegTrainer:
+    def __init__(self, args, net, train_loader, val_loader, criterion, optimizer, seg_loss_weight, device="cuda:0"):
+        self.net = net
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.amp = args.amp
+        self.grad_clip = args.grad_clip
+        self.device = device
+        self.max_epoch = args.max_epoch
+        self.dice_metric = monai.metrics.DiceMetric(reduction="none")
+        self.scaler = GradScaler() if self.amp else None
+        self.earlystop = EarlyStopping(patience=10)
+        self.seg_loss_weight = seg_loss_weight
+        if args.scheduler == "CosineAnnealing":
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, self.max_epoch, eta_min=self.optimizer.param_groups[0]['lr'] * 0.01)
+        elif args.scheduler == "Plateau":
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.8, patience=5, cooldown=2)
+        else:
+            self.scheduler = None
+
+    def fit(self, args):
+        train_loss = []
+        val_loss = []
+        best_val_loss = np.Inf
+        for epoch in range(self.max_epoch):
+            if next(self.net.parameters()).device != self.device:
+                self.net = self.net.to(self.device)
+            if self.amp:
+                epoch_train_loss_reduced = self.train_one_epoch_amp(epoch)
+            else:
+                epoch_train_loss_reduced = self.train_one_epoch(epoch)
+            train_loss.append(epoch_train_loss_reduced)
+            epoch_val_loss_reduced = self.validate(epoch)
+            if self.earlystop(epoch_val_loss_reduced):
+                break
+            val_loss.append(epoch_val_loss_reduced)
+            self.plot(args, train_loss, val_loss)
+            if args.scheduler == "CosineAnnealing":
+                self.scheduler.step()
+            elif args.scheduler == "Plateau":
+                self.scheduler.step(epoch_val_loss_reduced)
+            ckpt = {
+                "model": self.net.state_dict(),
+                "epoch": epoch,
+                "optimizer": self.optimizer.state_dict(),
+                "train_loss": epoch_train_loss_reduced,
+                "val_loss": epoch_val_loss_reduced,
+            }
+            if epoch_val_loss_reduced < best_val_loss:
+                torch.save(ckpt, (Path(args.model_save_path) / "model_best.pth"))
+                print(f"New best val loss: {best_val_loss:.4f} -> {epoch_val_loss_reduced:.4f}")
+                best_val_loss = epoch_val_loss_reduced
+            else:
+                torch.save(ckpt, (Path(args.model_save_path) / "model_latest.pth"))
+                print(f"Best val_loss didn't decrease, current val_loss: {epoch_val_loss_reduced:.4f}, best val_loss: {best_val_loss:.4f}")
+
+    def train_one_epoch_amp(self, epoch):
+        self.net.train()
+        pbar = tqdm(self.train_loader)
+        avg_loss = 0
+        for step, batch in enumerate(pbar):
+            img = batch["img"]
+            gt = batch["gt"]
+            # Avoid non-binary value caused by resize
+            gt[gt > 0.5] = 1
+            gt[gt <= 0.5] = 0
+            if img.device != self.device:
+                img = img.to(self.device)
+            if gt.device != self.device:
+                gt = gt.to(self.device)
+            with amp.autocast(device_type='cuda'):
+                preds = self.net(img)
+                l_seg = 0
+                for num, pred in enumerate(preds):
+                    l_seg += self.criterion(pred, gt) * self.seg_loss_weight[num]
+                loss = l_seg
+            self.scaler.scale(loss).backward()
+            if self.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad()
+            avg_loss += loss.item()
+            pbar.set_description(f"Epoch {epoch} training at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, "
+                                 f"loss: {loss.item():.4f}, lr:{self.optimizer.param_groups[0]['lr']}")
+        avg_loss /= len(self.train_loader)
+        return avg_loss
+
+    def train_one_epoch(self, epoch):
+        self.net.train()
+        pbar = tqdm(self.train_loader)
+        avg_loss = 0
+        for step, batch in enumerate(pbar):
+            img = batch["img"]
+            gt = batch["gt"]
+            # Avoid non-binary value caused by resize
+            gt[gt > 0.5] = 1
+            gt[gt <= 0.5] = 0
+            if img.device != self.device:
+                img = img.to(self.device)
+            if gt.device != self.device:
+                gt = gt.to(self.device)
+            preds = self.net(img)
+            l_seg = 0
+            for num, pred in enumerate(preds):
+                l_seg += self.criterion(pred, gt) * self.seg_loss_weight[num]
+            loss = l_seg
+            loss.backward()
+            if self.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            avg_loss += loss.item()
+            pbar.set_description(f"Epoch {epoch} training at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, "
+                                 f"loss: {loss.item():.4f}, lr:{self.optimizer.param_groups[0]['lr']}")
+        avg_loss /= len(self.train_loader)
+        return avg_loss
+
+    def validate(self, epoch):
+        self.net.eval()
+        dice_scores = []
+        pbar = tqdm(self.val_loader)
+        avg_loss = 0
+        with torch.no_grad():
+            for step, batch in enumerate(pbar):
+                img = batch["img"]
+                gt = batch["gt"]
+                # Avoid non-binary value caused by resize
+                gt[gt > 0.5] = 1
+                gt[gt <= 0.5] = 0
+                if img.device != self.device:
+                    img = img.to(self.device)
+                if gt.device != self.device:
+                    gt = gt.to(self.device)
+                pred = self.net(img)[-1]
+                loss = self.criterion(pred, gt)
+                pred_bin = pred
+                pred_bin[pred_bin > 0.5] = 1
+                pred_bin[pred_bin <= 0.5] = 0
+                dice_score_single = self.dice_metric(pred_bin, gt).squeeze().cpu().numpy().mean()
+                dice_scores.append(dice_score_single)
+                avg_loss += loss.item()
+                pbar.set_description(f"Epoch {epoch} Validating at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, "
+                                     f"loss: {loss.item():.4f}, lr:{self.optimizer.param_groups[0]['lr']}")
+        avg_loss /= len(self.train_loader)
+        dice_score_reduced = np.array(dice_scores).mean()
+        print("Dice: ", dice_score_reduced)
+        return avg_loss
+
+    def plot(self, args, train_loss, val_loss):
+        plt.plot(train_loss, label='Train Loss')
+        plt.plot(val_loss, label='Val Loss')
+        plt.title("Loss Curve")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend(loc="upper right")
+        plt.savefig(Path(args.model_save_path) / "loss_curve.png")
+        plt.close()
+
+
 class SegTester:
     def __init__(self, args, net, test_loader, device="cuda:0"):
         self.args = args
@@ -182,6 +345,7 @@ class SegTester:
         self.save_overlay = args.save_overlay
         self.save_csv = args.save_csv
         self.save_pred = args.save_pred
+        self.save_mask = False
         self.colors = [
             [0.1522, 0.4717, 0.9685],
             [0.3178, 0.0520, 0.8333],
@@ -204,25 +368,7 @@ class SegTester:
             [0.8033, 0.9278, 0.7621],
             [0.1085, 0.5155, 0.4145]
         ]
-        # self.bone_dsc = []
-        # self.dsc_reduced = []
-        # self.bone_nsd = []
-        # self.nsd_reduced = []
-        # self.bone_hd95 = []
-        # self.hd95_reduced = []
-        # self.bone_acc = []
-        # self.acc_reduced = []
-        # self.bone_prec = []
-        # self.prec_reduced = []
-        # self.bone_recall = []
-        # self.recall_reduced = []
-        # self.bone_f1 = []
-        # self.f1_reduced = []
-        # self.DSC = monai.metrics.DiceMetric(reduction="none")
-        # self.NSD = monai.metrics.SurfaceDistanceMetric(include_background=True, reduction="none")
-        # self.HD95 = monai.metrics.HausdorffDistanceMetric(include_background=True, percentile=95, reduction="none")
         self.metrics = SegmentationMetrics(num_classes=14)
-        # self.Precision = monai.metrics.
         if next(self.net.parameters()).device != self.device:
             self.net = self.net.to(self.device)
 
@@ -258,6 +404,8 @@ class SegTester:
                 if self.save_pred:
                     self.create_pred(self.args, image=img, pred=pred, mask=gt, fname=batch["fname"])
                     self.create_overlay_single(self.args, image=img, pred=pred, mask=gt, fname=batch["fname"])
+                if self.save_mask:
+                    self.create_mask(self.args, image=img, pred=pred, mask=gt, fname=batch["fname"])
         if self.save_csv:
             self.create_csv(self.args)
         metrics_dict = self.metrics.get_metrics()
@@ -354,10 +502,37 @@ class SegTester:
         plt.savefig(save_path / (fname[0] + '_gt.pdf'), dpi=600)
         plt.close()
 
+    def create_mask(self, args, image, pred, mask, fname):
+        for num, name in enumerate(fname):
+            save_path = Path(args.checkpoint) / "mask_single" / name
+            if not save_path.exists():
+                save_path.mkdir(parents=True)
+
+            pred_mask_bin = pred.detach()
+            pred_mask_bin[pred_mask_bin > 0.5] = 1
+            pred_mask_bin[pred_mask_bin <= 0.5] = 0
+
+            plt.imsave(save_path / f"img.pdf", image[num][0].cpu().numpy(), cmap="gray")
+            for i in range(14):
+                plt.imsave(save_path / f"pred_{i}.pdf", pred_mask_bin[num][i].cpu().numpy(), cmap="gray")
+                plt.imsave(save_path / f"gt_{i}.pdf", mask[num][i].cpu().numpy(), cmap="gray")
+
+
     def create_csv(self, args):
         save_path = Path(args.checkpoint)
         metrics_dict = self.metrics.get_metrics()
         num_classes = self.metrics.num_labels
+        overlap_dsc_mean_df = pd.DataFrame(metrics_dict["overlap_dsc"], columns=["Mean Overlap DSC"])
+        overlap_dsc_df = pd.DataFrame(metrics_dict["overlap_dsc_per_pair"], columns=[f"Overlap DSC {bone_name_dict[pair[0]]}-{bone_name_dict[pair[1]]}" for pair in metrics_dict["overlap_pairs"]])
+        overlap_nsd_mean_df = pd.DataFrame(metrics_dict["overlap_nsd"], columns=["Mean Overlap NSD"])
+        overlap_nsd_df = pd.DataFrame(metrics_dict["overlap_nsd_per_pair"], columns=[f"Overlap NSD {bone_name_dict[pair[0]]}-{bone_name_dict[pair[1]]}" for pair in metrics_dict["overlap_pairs"]])
+        overlap_voe_mean_df = pd.DataFrame(metrics_dict["overlap_voe"], columns=["Mean Overlap VOE"])
+        overlap_voe_df = pd.DataFrame(metrics_dict["overlap_voe_per_pair"], columns=[f"Overlap VOE {bone_name_dict[pair[0]]}-{bone_name_dict[pair[1]]}" for pair in metrics_dict["overlap_pairs"]])
+        overlap_msd_mean_df = pd.DataFrame(metrics_dict["overlap_msd"], columns=["Mean Overlap MSD"])
+        overlap_msd_df = pd.DataFrame(metrics_dict["overlap_msd_per_pair"], columns=[f"Overlap MSD {bone_name_dict[pair[0]]}-{bone_name_dict[pair[1]]}" for pair in metrics_dict["overlap_pairs"]])
+        overlap_ravd_mean_df = pd.DataFrame(metrics_dict["overlap_ravd"], columns=["Mean Overlap RAVD"])
+        overlap_ravd_df = pd.DataFrame(metrics_dict["overlap_ravd_per_pair"], columns=[f"Overlap RAVD {bone_name_dict[pair[0]]}-{bone_name_dict[pair[1]]}" for pair in metrics_dict["overlap_pairs"]])
+
         dsc_df = pd.DataFrame(metrics_dict["dsc_pc"], columns=[f"DSC {bone_name_dict[i]}" for i in range(num_classes)])
         dsc_mean_df = pd.DataFrame(metrics_dict["dsc"], columns=["Mean DSC"])
         nsd_df = pd.DataFrame(metrics_dict["nsd_pc"], columns=[f"NSD {bone_name_dict[i]}" for i in range(num_classes)])
@@ -369,7 +544,6 @@ class SegTester:
         ravd_df = pd.DataFrame(metrics_dict["ravd_pc"], columns=[f"RAVD {bone_name_dict[i]}" for i in range(num_classes)])
         ravd_mean_df = pd.DataFrame(metrics_dict["ravd"], columns=["Mean RAVD"])
 
-
         # acc_df = pd.DataFrame(metrics_dict["accuracy_pc"], columns=[f"Accuracy {bone_name_dict[i]}" for i in range(num_classes)])
         # acc_mean_df = pd.DataFrame(metrics_dict["accuracy"], columns=["Mean Accuracy"])
         # precision_df = pd.DataFrame(metrics_dict["precision_pc"], columns=[f"Precision {bone_name_dict[i]}" for i in range(num_classes)])
@@ -380,8 +554,201 @@ class SegTester:
         # f1_mean_df = pd.DataFrame(metrics_dict["f1score"], columns=["Mean F1-score"])
         fname_df = pd.DataFrame(metrics_dict["fname"], columns=['Case'])
         metric_df = pd.concat(
-         [fname_df, dsc_df, dsc_mean_df, nsd_df, nsd_mean_df, voe_df, voe_mean_df, msd_df, msd_mean_df,
-               ravd_df, ravd_mean_df], axis=1)
+            [fname_df, overlap_dsc_df, overlap_dsc_mean_df, overlap_nsd_df, overlap_nsd_mean_df, overlap_voe_df,
+             overlap_voe_mean_df, overlap_msd_df, overlap_msd_mean_df, overlap_ravd_df, overlap_ravd_mean_df, dsc_df,
+             dsc_mean_df, nsd_df, nsd_mean_df, voe_df, voe_mean_df, msd_df, msd_mean_df, ravd_df, ravd_mean_df], axis=1)
+        # metric_df = pd.concat(
+        #     [fname_df, dsc_df, dsc_mean_df, nsd_df, nsd_mean_df, hd95_df, hd95_mean_df, acc_df, acc_mean_df,
+        #      precision_df, precision_mean_df, recall_df, recall_mean_df, f1_df,f1_mean_df], axis=1)
+        # 仅在有限值上求均值：跳过 inf 和 NaN
+        vals = metric_df.iloc[:, 1:].to_numpy(dtype=float)
+        finite_means = np.nanmean(np.where(np.isfinite(vals), vals, np.nan), axis=0)
+        column_means = pd.Series(finite_means, index=metric_df.columns[1:])
+        average_row = pd.DataFrame([['Average'] + column_means.tolist()], columns=metric_df.columns)
+        final_df = pd.concat([metric_df, average_row], ignore_index=True)
+        final_df.to_csv((save_path / 'test_metrics.csv'), index=False)
+
+
+class IterSegTester:
+    def __init__(self, args, net, test_loader, device="cuda:0"):
+        self.args = args
+        self.net = net
+        self.net.load_state_dict(torch.load((Path(args.checkpoint) / "model_best.pth"))["model"])
+        self.test_loader = test_loader
+        self.device = device
+        self.save_overlay = args.save_overlay
+        self.save_csv = args.save_csv
+        self.save_pred = args.save_pred
+        self.colors = [
+            [0.1522, 0.4717, 0.9685],
+            [0.3178, 0.0520, 0.8333],
+            [0.3834, 0.3823, 0.6784],
+            [0.8525, 0.1303, 0.4139],
+            [0.9948, 0.8252, 0.3384],
+            [0.8476, 0.7147, 0.2453],
+            [0.2865, 0.8411, 0.0877],
+            [0.1558, 0.4940, 0.4668],
+            [0.9199, 0.5882, 0.5113],
+            [0.1335, 0.5433, 0.6149],
+            [0.0629, 0.7343, 0.0943],
+            [0.8183, 0.2786, 0.3053],
+            [0.1789, 0.5083, 0.6787],
+            [0.9746, 0.1909, 0.4295],
+            [0.1586, 0.8670, 0.6994],
+            [0.9156, 0.1241, 0.3829],
+            [0.2998, 0.3054, 0.4242],
+            [0.7719, 0.7786, 0.1164],
+            [0.8033, 0.9278, 0.7621],
+            [0.1085, 0.5155, 0.4145]
+        ]
+        self.metrics = SegmentationMetrics(num_classes=14)
+        if next(self.net.parameters()).device != self.device:
+            self.net = self.net.to(self.device)
+
+    def test(self):
+        self.net.eval()
+        pbar = tqdm(self.test_loader)
+        total_infer_time = 0
+        total_items = 0
+        with torch.no_grad():
+            for step, batch in enumerate(pbar):
+                img = batch["img"]
+                gt = batch["gt"]
+                # Avoid non-binary value caused by resize
+                gt[gt > 0.5] = 1
+                gt[gt <= 0.5] = 0
+                if img.device != self.device:
+                    img = img.to(self.device)
+                if gt.device != self.device:
+                    gt = gt.to(self.device)
+                start_time = time.time()  # ⏱️ Start timing
+                pred = self.net(img)[-1]
+                end_time = time.time()  # ⏱️ End timing
+                infer_time = end_time - start_time
+                total_infer_time += infer_time
+                total_items += img.shape[0]  # 批量大小
+                pred_bin = pred
+                pred_bin[pred_bin > 0.5] = 1
+                pred_bin[pred_bin <= 0.5] = 0
+                self.metrics.update_metrics(pred_bin, gt, batch["fname"][0])
+                pbar.set_description(f"Testing at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                if self.save_overlay:
+                    self.create_overlay(self.args, image=img, pred=pred, mask=gt, fname=batch["fname"])
+                if self.save_pred:
+                    self.create_pred(self.args, image=img, pred=pred, mask=gt, fname=batch["fname"])
+                    self.create_overlay_single(self.args, image=img, pred=pred, mask=gt, fname=batch["fname"])
+        if self.save_csv:
+            self.create_csv(self.args)
+        metrics_dict = self.metrics.get_metrics()
+        dsc_reduced = metrics_dict["dsc"].mean()
+        print("Mean DSC: ", dsc_reduced)
+        nsd_reduced = metrics_dict["nsd"].mean()
+        print("Mean NSD: ", nsd_reduced)
+
+        avg_infer_time = total_infer_time / total_items
+        print(f"Average inference time per item: {avg_infer_time * 1000:.2f} ms")
+
+    def create_overlay(self, args, image, pred, mask, fname):
+        save_path = Path(args.checkpoint) / "overlay"
+        if not save_path.exists():
+            save_path.mkdir(parents=True)
+
+        pred_mask_bin = pred.detach()
+        pred_mask_bin[pred_mask_bin > 0.5] = 1
+        pred_mask_bin[pred_mask_bin <= 0.5] = 0
+        fig, ax = plt.subplots(1, 3, figsize=(15, 6))
+        ax[0].imshow(image[0][0].cpu().numpy(), 'gray')
+        ax[1].imshow(image[0][0].cpu().numpy(), 'gray')
+        ax[2].imshow(image[0][0].cpu().numpy(), 'gray')
+        ax[0].set_title("Image")
+        ax[1].set_title("Segmentation")
+        ax[2].set_title("GT")
+        ax[0].axis('off')
+        ax[1].axis('off')
+        ax[2].axis('off')
+
+        for i in range(pred_mask_bin.shape[1]):
+            seg = pred_mask_bin[0][i].cpu().numpy()
+            show_mask((seg == 1).astype(np.uint8), ax[1], mask_color=np.array(self.colors[i]))
+            show_mask((mask[0][i].cpu().numpy() == 1).astype(np.uint8), ax[2], mask_color=np.array(self.colors[i]))
+        plt.tight_layout()
+        plt.savefig(save_path / (fname[0] + '.pdf'), dpi=600)
+        plt.close()
+
+    def create_pred(self, args, image, pred, mask, fname):
+        save_path = Path(args.checkpoint) / "pred"
+        if not save_path.exists():
+            save_path.mkdir(parents=True)
+
+        pred_mask_bin = pred.detach()
+        pred_mask_bin[pred_mask_bin > 0.5] = 1
+        pred_mask_bin[pred_mask_bin <= 0.5] = 0
+
+        fig_pred, ax_pred = plt.subplots(figsize=(5, 5))
+        ax_pred.axis('off')  # 不显示坐标轴
+        for i in range(pred_mask_bin.shape[1]):
+            seg = pred_mask_bin[0][i].cpu().numpy()
+            show_mask((seg == 1).astype(np.uint8), ax_pred, mask_color=np.array(self.colors[i]))
+        plt.tight_layout()
+        plt.savefig(save_path / (fname[0] + '_pred.pdf'), dpi=600)
+        plt.close()
+
+        fig_gt, ax_gt = plt.subplots(figsize=(5, 5))
+        ax_gt.axis('off')  # 不显示坐标轴
+        for i in range(pred_mask_bin.shape[1]):
+            show_mask((mask[0][i].cpu().numpy() == 1).astype(np.uint8), ax_gt, mask_color=np.array(self.colors[i]))
+        plt.tight_layout()
+        plt.savefig(save_path / (fname[0] + '_gt.pdf'), dpi=600)
+        plt.close()
+
+    def create_overlay_single(self, args, image, pred, mask, fname):
+        save_path = Path(args.checkpoint) / "overlay_single"
+        if not save_path.exists():
+            save_path.mkdir(parents=True)
+
+        pred_mask_bin = pred.detach()
+        pred_mask_bin[pred_mask_bin > 0.5] = 1
+        pred_mask_bin[pred_mask_bin <= 0.5] = 0
+
+        fig_pred, ax_pred = plt.subplots(figsize=(5, 5))
+        ax_pred.imshow(image[0][0].cpu().numpy(), 'gray')
+        ax_pred.axis('off')  # 不显示坐标轴
+        for i in range(pred_mask_bin.shape[1]):
+            seg = pred_mask_bin[0][i].cpu().numpy()
+            show_mask((seg == 1).astype(np.uint8), ax_pred, mask_color=np.array(self.colors[i]))
+        plt.tight_layout()
+        plt.savefig(save_path / (fname[0] + '_pred.pdf'), dpi=600)
+        plt.close()
+
+        fig_gt, ax_gt = plt.subplots(figsize=(5, 5))
+        ax_gt.imshow(image[0][0].cpu().numpy(), 'gray')
+        ax_gt.axis('off')  # 不显示坐标轴
+        for i in range(pred_mask_bin.shape[1]):
+            show_mask((mask[0][i].cpu().numpy() == 1).astype(np.uint8), ax_gt, mask_color=np.array(self.colors[i]))
+        plt.tight_layout()
+        plt.savefig(save_path / (fname[0] + '_gt.pdf'), dpi=600)
+        plt.close()
+
+    def create_csv(self, args):
+        save_path = Path(args.checkpoint)
+        metrics_dict = self.metrics.get_metrics()
+        num_classes = self.metrics.num_labels
+        overlap_dsc_mean_df = pd.DataFrame(metrics_dict["overlap_dsc"], columns=["Mean Overlap DSC"])
+        overlap_nsd_mean_df = pd.DataFrame(metrics_dict["overlap_nsd"], columns=["Mean Overlap NSD"])
+        dsc_df = pd.DataFrame(metrics_dict["dsc_pc"], columns=[f"DSC {bone_name_dict[i]}" for i in range(num_classes)])
+        dsc_mean_df = pd.DataFrame(metrics_dict["dsc"], columns=["Mean DSC"])
+        nsd_df = pd.DataFrame(metrics_dict["nsd_pc"], columns=[f"NSD {bone_name_dict[i]}" for i in range(num_classes)])
+        nsd_mean_df = pd.DataFrame(metrics_dict["nsd"], columns=["Mean NSD"])
+        voe_df = pd.DataFrame(metrics_dict["voe_pc"], columns=[f"VOE {bone_name_dict[i]}" for i in range(num_classes)])
+        voe_mean_df = pd.DataFrame(metrics_dict["voe"], columns=["Mean VOE"])
+        msd_df = pd.DataFrame(metrics_dict["msd_pc"], columns=[f"MSD {bone_name_dict[i]}" for i in range(num_classes)])
+        msd_mean_df = pd.DataFrame(metrics_dict["msd"], columns=["Mean MSD"])
+        ravd_df = pd.DataFrame(metrics_dict["ravd_pc"], columns=[f"RAVD {bone_name_dict[i]}" for i in range(num_classes)])
+        ravd_mean_df = pd.DataFrame(metrics_dict["ravd"], columns=["Mean RAVD"])
+        fname_df = pd.DataFrame(metrics_dict["fname"], columns=['Case'])
+        metric_df = pd.concat(
+         [fname_df, overlap_dsc_mean_df, overlap_nsd_mean_df, dsc_df, dsc_mean_df, nsd_df, nsd_mean_df, voe_df,
+               voe_mean_df, msd_df, msd_mean_df, ravd_df, ravd_mean_df], axis=1)
         # metric_df = pd.concat(
         #     [fname_df, dsc_df, dsc_mean_df, nsd_df, nsd_mean_df, hd95_df, hd95_mean_df, acc_df, acc_mean_df,
         #      precision_df, precision_mean_df, recall_df, recall_mean_df, f1_df,f1_mean_df], axis=1)
@@ -481,8 +848,6 @@ class SegInferer:
         plt.tight_layout()
         plt.savefig(save_path / (fname[0] + '.pdf'), dpi=600)
         plt.close()
-
-
 
     def create_csv(self, args):
         save_path = Path(args.checkpoint)
@@ -793,21 +1158,37 @@ class RegTester:
         metrics_dict = self.metrics.get_metrics()
         joint_metrics = metrics_dict["joint_metrics"]
 
+        # 新增：收集所有 confusion matrix
+        rows = []
+
         for joint, m in joint_metrics.items():
             tn, fp, fn, tp = m["confusion_matrix"]
 
             confmat = np.array([[tn, fp],
                                 [fn, tp]])
 
+            # 保存每个 joint 的 confusion matrix 图
             disp = ConfusionMatrixDisplay(confusion_matrix=confmat, display_labels=["w/o BE", "w/ BE"])
             fig, ax = plt.subplots(figsize=(4, 4))
             disp.plot(cmap='Blues', ax=ax, xticks_rotation='vertical')
             ax.set_title(f"Confusion Matrix: {joint}")
             plt.tight_layout()
 
-            # 保存PDF
             fig.savefig(save_path / f'{joint}_confusion.pdf')
             plt.close(fig)
+
+            # 新增：保存到行数据
+            rows.append({
+                "joint": joint,
+                "TN": tn,
+                "FP": fp,
+                "FN": fn,
+                "TP": tp
+            })
+
+        # 新增：导出 CSV
+        df = pd.DataFrame(rows, columns=["joint", "TN", "FP", "FN", "TP"])
+        df.to_csv(save_path / "all_confusions.csv", index=False)
 
     def collect_matched_folders(self, all_entries, output_path):
         """
