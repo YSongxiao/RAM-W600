@@ -3,11 +3,11 @@ This is the benchmark code for the "RAM-W600: A Multi-Task Wrist Dataset and Ben
 Dataset URL: <https://huggingface.co/datasets/TokyoTechMagicYang/RAM-W600>.
 
 ## Update
-- **[2025-05-10]** We released the first update of the RAM-W600 dataset, which includes 621 X-ray images.  
 
 - **[2025-08-29]** We conducted a major update of the RAM-W600 dataset.  
-  In this update, we expanded the dataset with 427 additional X-ray images and released part of the metadata.  
-  
+  In this update, we expanded the dataset with 427 additional X-ray images, updated the split and released the metadata.
+
+- **[2025-05-10]** We released the first update of the RAM-W600 dataset, which includes 621 X-ray images.  
 
 ## Setup
 - Install the conda environment
