@@ -4,6 +4,8 @@ Dataset URL: <https://huggingface.co/datasets/TokyoTechMagicYang/RAM-W600>.
 
 ## Update
 
+- **[2025-09-19]** :tada::tada:Our dataset and benchmark paper has been accepted by NeurIPS 2025! :tada::tada:
+
 - **[2025-08-29]** We conducted a major update of the RAM-W600 dataset.  
   In this update, we expanded the dataset with 427 additional X-ray images, updated the split and released the metadata.
 
@@ -49,3 +51,4 @@ bash train_seg.sh
 ```bash
 bash test_seg.sh
 ```
+
