@@ -6,16 +6,16 @@ Dataset URL: <https://huggingface.co/datasets/TokyoTechMagicYang/RAM-W600>.
 
 - **[2025-09-19]** :tada::tada:Our dataset and benchmark paper has been accepted by NeurIPS 2025! :tada::tada:
 
-- **[2025-08-29]** We conducted a major update of the RAM-W1K dataset.  
+- **[2025-08-29]** We conducted a major update of the RAM-W600 dataset.  
   In this update, we expanded the dataset with 427 additional X-ray images, updated the split and released the metadata.
 
-- **[2025-05-10]** We released the first update of the RAM-W1K dataset, which includes 621 X-ray images.  
+- **[2025-05-10]** We released the first update of the RAM-W600 dataset, which includes 621 X-ray images.  
 
 ## Setup
 - Install the conda environment
 ```bash
-conda create -n ramw1k python=3.10
-conda activate ramw1k
+conda create -n ramw600 python=3.10
+conda activate ramw600
 ```
 
 - Install PyTorch
@@ -51,6 +51,7 @@ bash train_seg.sh
 ```bash
 bash test_seg.sh
 ```
+
 
 
 
