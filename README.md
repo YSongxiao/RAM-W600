@@ -52,6 +52,20 @@ bash train_seg.sh
 bash test_seg.sh
 ```
 
+## Citation
+
+If you use RAM-W600 in your research, please cite:
+
+```bibtex
+@article{songxiao2026ram,
+  title={RAM-W600: A Multi-Task Wrist Dataset and Benchmark for Rheumatoid Arthritis},
+  author={Yang, Songxiao and Wang, Haolin and Fu, Yao and Tian, Ye and Kamishima, Tamostu and Ikebe, Masayuki and Ou, Yafei and Okutomi, Masatoshi},
+  journal={Advances in Neural Information Processing Systems},
+  volume={38},
+  year={2026}
+}
+```
+
 
 
 
