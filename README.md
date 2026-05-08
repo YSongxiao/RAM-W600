@@ -66,6 +66,22 @@ If you use RAM-W600 in your research, please cite:
 }
 ```
 
+## Suggested Citation
+
+If you use the benchmark code or experimental settings, we also recommend citing:
+
+```bibtex
+@misc{yang2026ramh1200,
+  title={RAM-H1200: A Unified Evaluation and Dataset on Hand Radiographs for Rheumatoid Arthritis},
+  author={Songxiao Yang and Haolin Wang and Yao Fu and Junmu Peng and Lin Fan and Hongruixuan Chen and Jian Song and Masayuki Ikebe and Shinya Takamaeda-Yamazaki and Masatoshi Okutomi and Tamotsu Kamishima and Yafei Ou},
+  year={2026},
+  eprint={2605.05616},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2605.05616}
+}
+```
+
 
 
 
